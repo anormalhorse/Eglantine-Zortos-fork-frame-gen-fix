@@ -76,6 +76,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(NV, OpticalFlow, OPTICAL_FLOW, optical_flow)                                           \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
@@ -100,6 +101,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
     EXTENSION(KHR, DEPTH_STENCIL_RESOLVE, depth_stencil_resolve)                                   \
     EXTENSION(KHR, DRAW_INDIRECT_COUNT, draw_indirect_count)                                       \
     EXTENSION(KHR, DRIVER_PROPERTIES, driver_properties)                                           \
+    EXTENSION(KHR, FORMAT_FEATURE_FLAGS_2, format_feature_flags2)                                  \
     EXTENSION(KHR, PUSH_DESCRIPTOR, push_descriptor)                                               \
     EXTENSION(KHR, SAMPLER_MIRROR_CLAMP_TO_EDGE, sampler_mirror_clamp_to_edge)                     \
     EXTENSION(KHR, SHADER_FLOAT_CONTROLS, shader_float_controls)                                   \
@@ -299,6 +301,21 @@ public:
     /// Returns main present queue family index.
     u32 GetPresentFamily() const {
         return present_family;
+    }
+
+    /// Returns true when VK_NV_optical_flow is enabled and a dedicated optical flow queue exists.
+    bool CanUseOpticalFlow() const {
+        return extensions.optical_flow && has_optical_flow_queue;
+    }
+
+    /// Returns the optical flow queue family index (valid when CanUseOpticalFlow() is true).
+    u32 GetOpticalFlowFamily() const {
+        return optical_flow_family;
+    }
+
+    /// Returns the optical flow queue (valid when CanUseOpticalFlow() is true).
+    vk::Queue GetOpticalFlowQueue() const {
+        return optical_flow_queue;
     }
 
     /// Returns the current Vulkan API version provided in Vulkan-formatted version numbers.
@@ -1206,11 +1223,14 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue optical_flow_queue; ///< Optical flow queue (VK_NV_optical_flow), if any.
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.
+    u32 optical_flow_family{};   ///< Optical flow queue family index (VK_NV_optical_flow).
+    bool has_optical_flow_queue{}; ///< True when a dedicated optical flow queue family exists.
     bool graphics_family_sparse_binding{};
 
     struct Extensions {

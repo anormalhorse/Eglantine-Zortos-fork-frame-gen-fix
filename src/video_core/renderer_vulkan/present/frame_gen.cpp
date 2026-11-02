@@ -209,17 +209,29 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     }
 
     if (unavailable || !Settings::values.frame_gen.GetValue()) {
-        if (chain || fsr3_chain) {
+        if (chain || fsr3_chain || nvof_chain) {
             scheduler.Finish();
             chain.reset();
             fsr3_chain.reset();
+            nvof_chain.reset();
         }
         warm_streak = 0;
         return;
     }
 
+    nvof_supported = NvOpticalFlowFrameGen::IsSupported(device, format);
+
+    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::NvOpticalFlow &&
+        !nvof_supported && !logged_nvof_fallback) {
+        LOG_WARNING(Render_Vulkan,
+                    "NVIDIA optical flow frame generation is not available on this GPU/driver "
+                    "(needs an NVIDIA RTX GPU with VK_NV_optical_flow and an 8-bit RGBA/BGRA "
+                    "output). Falling back to FSR3 frame generation.");
+        logged_nvof_fallback = true;
+    }
+
     if (!shaders->IsValid() &&
-        Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3 &&
+        Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Lsfg &&
         !logged_lsfg_fallback) {
         LOG_ERROR(Render_Vulkan,
                   "Lossless Scaling frame generation (LSFG) is not available (status {}): the "
@@ -246,8 +258,9 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
 
     const VkExtent2D extent{.width = frame->width, .height = frame->height};
     const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, extent);
-    if ((!chain && !fsr3_chain) || built_extent.width != extent.width || built_extent.height != extent.height ||
-        built_format != format || built_flow_scale != flow_scale) {
+    if ((!chain && !fsr3_chain && !nvof_chain) || built_extent.width != extent.width ||
+        built_extent.height != extent.height || built_format != format ||
+        built_flow_scale != flow_scale || built_backend != CurrentBackend()) {
         Rebuild(device, extent, format, flow_scale);
     }
 
@@ -259,17 +272,30 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
 
-    const bool use_fsr3 = UseFsr3();
+    const Backend backend = CurrentBackend();
+    const bool use_fsr3 = backend == Backend::Fsr3;
 
     if (++log_counter % 300 == 1) {
         LOG_INFO(Render_Vulkan,
                  "Frame generation: backend={} frames={} planned_generations={} warm={} "
                  "warm_streak={} generating={}",
-                 use_fsr3 ? "FSR3" : "LSFG", count, plan.generations, plan.warm, warm_streak,
-                 generated);
+                 backend == Backend::NvOpticalFlow ? "NVIDIA Optical Flow"
+                                                   : (use_fsr3 ? "FSR3" : "LSFG"),
+                 count, plan.generations, plan.warm, warm_streak, generated);
     }
 
-    if (use_fsr3 && fsr3_chain) {
+    if (backend == Backend::NvOpticalFlow && nvof_chain) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+        nvof_chain->Process(device, scheduler, *frame->image, *frame->storage_view, count);
+
+        if (nvof_chain->HasFailed()) {
+            // The backend already logged why. Drop it and let the next frame rebuild with FSR3.
+            nvof_failed = true;
+            scheduler.Finish();
+            nvof_chain.reset();
+            generated = false;
+        }
+    } else if (use_fsr3 && fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
         fsr3_chain->Process(device, scheduler, *frame->image, *frame->storage_view, count);
     } else if (chain) {
@@ -308,7 +334,13 @@ size_t FrameGen::GeneratedFrameCount() const {
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
     const bool use_fsr3 = UseFsr3();
 
-    if (use_fsr3 && fsr3_chain) {
+    if (UseNvOpticalFlow() && nvof_chain) {
+        const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
+        const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
+
+        scheduler.RequestOutsideRenderPassOperationContext();
+        nvof_chain->Generate(device, scheduler, *destination->storage_view, blend, flow_scale);
+    } else if (use_fsr3 && fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
 
@@ -330,27 +362,56 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
     }
 }
 
+bool FrameGen::UseNvOpticalFlow() const {
+    return Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::NvOpticalFlow &&
+           nvof_supported && !nvof_failed;
+}
+
 bool FrameGen::UseFsr3() const {
-    return Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3 ||
-           (shaders && !shaders->IsValid());
+    const Settings::FrameGenType type = Settings::values.frame_gen_type.GetValue();
+    if (type == Settings::FrameGenType::NvOpticalFlow) {
+        return !UseNvOpticalFlow();
+    }
+    return type == Settings::FrameGenType::Fsr3 || (shaders && !shaders->IsValid());
+}
+
+FrameGen::Backend FrameGen::CurrentBackend() const {
+    if (UseNvOpticalFlow()) {
+        return Backend::NvOpticalFlow;
+    }
+    return UseFsr3() ? Backend::Fsr3 : Backend::Lsfg;
 }
 
 void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale) {
     scheduler.Finish();
     chain.reset();
     fsr3_chain.reset();
+    nvof_chain.reset();
 
     built_flow_scale = flow_scale;
 
-    LOG_INFO(Render_Vulkan, "Frame generation: building {} chain at {}x{} (flow scale {:.2f})",
-             UseFsr3() ? "FSR3" : "LSFG",
-             extent.width, extent.height, flow_scale);
-
-    if (UseFsr3()) {
-        fsr3_chain.emplace(device, memory_allocator, extent, format);
-    } else {
-        chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
+    if (UseNvOpticalFlow()) {
+        LOG_INFO(Render_Vulkan,
+                 "Frame generation: building NVIDIA Optical Flow chain at {}x{}", extent.width,
+                 extent.height);
+        nvof_chain.emplace(device, memory_allocator, extent, format);
+        if (nvof_chain->HasFailed()) {
+            nvof_failed = true;
+            nvof_chain.reset();
+        }
     }
+
+    if (!nvof_chain) {
+        LOG_INFO(Render_Vulkan, "Frame generation: building {} chain at {}x{} (flow scale {:.2f})",
+                 UseFsr3() ? "FSR3" : "LSFG", extent.width, extent.height, flow_scale);
+
+        if (UseFsr3()) {
+            fsr3_chain.emplace(device, memory_allocator, extent, format);
+        } else {
+            chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
+        }
+    }
+    built_backend = CurrentBackend();
     built_extent = extent;
     built_format = format;
     frame_count = 0;

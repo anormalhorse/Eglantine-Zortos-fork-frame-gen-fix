@@ -750,6 +750,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (has_optical_flow_queue) {
+        optical_flow_queue = logical.GetQueue(optical_flow_family);
+    }
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
@@ -1594,6 +1597,15 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.synchronization2 = features.synchronization2.synchronization2;
     RemoveExtensionFeatureIfUnsuitable(extensions.synchronization2, features.synchronization2,
                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+
+    // VK_NV_optical_flow (requires VK_KHR_format_feature_flags2 and VK_KHR_synchronization2,
+    // both core in Vulkan 1.3)
+    extensions.optical_flow =
+        extensions.optical_flow && features.optical_flow.opticalFlow &&
+        (instance_version >= VK_API_VERSION_1_3 ||
+         (extensions.format_feature_flags2 && extensions.synchronization2));
+    RemoveExtensionFeatureIfUnsuitable(extensions.optical_flow, features.optical_flow,
+                                       VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {
@@ -1630,6 +1642,29 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     }
     if (present) {
         present_family = *present;
+    }
+
+    // VK_NV_optical_flow executes on its own queue family (VK_QUEUE_OPTICAL_FLOW_BIT_NV).
+    has_optical_flow_queue = false;
+    if (extensions.optical_flow) {
+        for (u32 index = 0; index < static_cast<u32>(queue_family_properties.size()); ++index) {
+            const VkQueueFamilyProperties& queue_family = queue_family_properties[index];
+            if (queue_family.queueCount == 0 || index == graphics_family ||
+                index == present_family) {
+                continue;
+            }
+            if (queue_family.queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV) {
+                optical_flow_family = index;
+                has_optical_flow_queue = true;
+                break;
+            }
+        }
+        if (has_optical_flow_queue) {
+            LOG_INFO(Render_Vulkan, "Optical flow queue family: {}", optical_flow_family);
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "VK_NV_optical_flow is available but no dedicated optical flow queue exists");
+        }
     }
 }
 
@@ -1789,6 +1824,9 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
+    if (has_optical_flow_queue) {
+        unique_queue_families.insert(optical_flow_family);
+    }
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 
