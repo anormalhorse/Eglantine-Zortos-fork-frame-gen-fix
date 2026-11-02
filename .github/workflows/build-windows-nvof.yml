@@ -1,0 +1,123 @@
+name: build-windows-nvof
+
+# Build veloce solo per Windows, da avviare a mano (Actions > build-windows > Run workflow).
+# Non pubblica release: il programma resta come artifact scaricabile per 7 giorni.
+on:
+  workflow_dispatch:
+  push:
+    branches: [nvof]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-nvof
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: windows-x86_64 binary
+    runs-on: windows-2022
+    env:
+      BUILD_TAG: manual-build-${{ github.run_number }}
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 2G
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: nvof
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install sccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
+          $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Cache CPM downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: cpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore compiler objects
+        uses: actions/cache/restore@v4
+        with:
+          path: .sccache
+          key: objects-windows-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            objects-windows-x86_64-
+
+      # Solo l'emulatore (target yuzu): niente yuzu-cmd, quindi si compila meno.
+      - name: Configure
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=OFF
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=ON
+          "-DEGLANTINE_UPDATE_REPO=$GITHUB_REPOSITORY"
+          "-DEGLANTINE_BUILD_TAG=$BUILD_TAG"
+          "-DEGLANTINE_BUILD_PLATFORM=windows-x86_64"
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build
+        shell: bash
+        run: |
+          sccache --zero-stats
+          cmake --build build/release --target yuzu --parallel
+          sccache --show-stats
+
+      # Salvata anche se la build fallisce o la corsa viene cancellata.
+      - name: Save compiler objects
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .sccache
+          key: objects-windows-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'build/release/bin/eglantine.exe')) {
+            throw 'build/release/bin/eglantine.exe was not produced'
+          }
+          windeployqt --release --no-translations build/release/bin/eglantine.exe
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: eglantine-windows-x86_64-${{ github.run_number }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 7
