@@ -1,4 +1,4 @@
-name: build-windows
+name: build-windows-nvof
 
 # Build veloce solo per Windows, da avviare a mano (Actions > build-windows > Run workflow).
 # Non pubblica release: il programma resta come artifact scaricabile per 7 giorni.
